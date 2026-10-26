@@ -163,3 +163,8 @@ msrv:
 
 version-major:
 	@echo $(VERSION_MAJOR)
+
+check-mainnet-limits:
+	MAINNET_NETWORK_SETTINGS_XDR="$$(stellar network settings --network mainnet --internal --output xdr)" \
+	STELLAR_CLI_VERSION=$(VERSION_MAJOR).0.0 \
+		cargo test --package soroban-sdk --lib --features testutils tests::cost_estimate::test_mainnet_limits_and_fees_snapshot -- --exact --nocapture

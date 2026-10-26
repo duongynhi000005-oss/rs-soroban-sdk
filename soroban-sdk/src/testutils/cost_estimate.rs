@@ -13,6 +13,34 @@ impl CostEstimate {
         Self { env }
     }
 
+    pub(crate) fn mainnet_fee_config() -> (FeeConfiguration, i64, i64, i64) {
+        // This is a snapshot of the Stellar Mainnet fees as of 2026-07-10.
+        // Refresh it with the values from `stellar network settings --network
+        // mainnet` (or <https://lab.stellar.org/network-limits>) when it drifts.
+        let pubnet_fee_config = FeeConfiguration {
+            fee_per_instruction_increment: 7,
+            fee_per_disk_read_entry: 1563,
+            fee_per_write_entry: 2500,
+            fee_per_disk_read_1kb: 447,
+            fee_per_write_1kb: 875,
+            fee_per_historical_1kb: 4059,
+            fee_per_contract_event_1kb: 5000,
+            fee_per_transaction_size_1kb: 406,
+        };
+        let pubnet_persistent_rent_rate_denominator = 1215;
+        let pubnet_temp_rent_rate_denominator = 2430;
+        // This is a bit higher than the current network fee, it's an
+        // overestimate for the sake of providing a bit more conservative
+        // results in case if the state grows.
+        let fee_per_rent_1kb = 12000;
+        (
+            pubnet_fee_config,
+            fee_per_rent_1kb,
+            pubnet_persistent_rent_rate_denominator,
+            pubnet_temp_rent_rate_denominator,
+        )
+    }
+
     /// Returns the resources metered during the last top level contract
     /// invocation.    
     /// Take the return value with a grain of salt. The returned resources mostly
@@ -53,25 +81,12 @@ impl CostEstimate {
     /// VM instantiation and execution, as well as Wasm reads/rent bumps will be
     /// missed.
     pub fn fee(&self) -> FeeEstimate {
-        // This is a snapshot of the Stellar Mainnet fees as of 2026-07-10.
-        // Refresh it with the values from `stellar network settings --network
-        // mainnet` (or <https://lab.stellar.org/network-limits>) when it drifts.
-        let pubnet_fee_config = FeeConfiguration {
-            fee_per_instruction_increment: 7,
-            fee_per_disk_read_entry: 1563,
-            fee_per_write_entry: 2500,
-            fee_per_disk_read_1kb: 447,
-            fee_per_write_1kb: 875,
-            fee_per_historical_1kb: 4059,
-            fee_per_contract_event_1kb: 5000,
-            fee_per_transaction_size_1kb: 406,
-        };
-        let pubnet_persistent_rent_rate_denominator = 1215;
-        let pubnet_temp_rent_rate_denominator = 2430;
-        // This is a bit higher than the current network fee, it's an
-        // overestimate for the sake of providing a bit more conservative
-        // results in case if the state grows.
-        let fee_per_rent_1kb = 12000;
+        let (
+            pubnet_fee_config,
+            fee_per_rent_1kb,
+            pubnet_persistent_rent_rate_denominator,
+            pubnet_temp_rent_rate_denominator,
+        ) = Self::mainnet_fee_config();
         self.resources().estimate_fees(
             &pubnet_fee_config,
             fee_per_rent_1kb,

@@ -290,3 +290,251 @@ fn test_cost_estimate_budget() {
         .as_str(),
     );
 }
+
+fn extract_mainnet_limits_and_fees(
+    upgrade_set: &soroban_sdk::xdr::ConfigUpgradeSet,
+) -> (
+    soroban_env_host::InvocationResourceLimits,
+    soroban_env_host::fees::FeeConfiguration,
+    i64,
+    i64,
+    Option<i64>,
+) {
+    use soroban_env_host::fees::{
+        compute_rent_write_fee_per_1kb, FeeConfiguration, RentWriteFeeConfiguration,
+    };
+    use soroban_env_host::InvocationResourceLimits;
+    use soroban_sdk::xdr::ConfigSettingEntry;
+
+    let mut compute = None;
+    let mut ledger_cost = None;
+    let mut ledger_cost_ext = None;
+    let mut historical_data = None;
+    let mut events = None;
+    let mut bandwidth = None;
+    let mut state_archival = None;
+    let mut max_key_size = None;
+    let mut max_entry_size = None;
+    let mut max_code_size = None;
+    let mut state_size_window = None;
+
+    for entry in upgrade_set.updated_entry.iter() {
+        match entry {
+            ConfigSettingEntry::ContractComputeV0(v) => compute = Some(v.clone()),
+            ConfigSettingEntry::ContractLedgerCostV0(v) => ledger_cost = Some(v.clone()),
+            ConfigSettingEntry::ContractLedgerCostExtV0(v) => ledger_cost_ext = Some(v.clone()),
+            ConfigSettingEntry::ContractHistoricalDataV0(v) => historical_data = Some(v.clone()),
+            ConfigSettingEntry::ContractEventsV0(v) => events = Some(v.clone()),
+            ConfigSettingEntry::ContractBandwidthV0(v) => bandwidth = Some(v.clone()),
+            ConfigSettingEntry::StateArchival(v) => state_archival = Some(v.clone()),
+            ConfigSettingEntry::ContractDataKeySizeBytes(v) => max_key_size = Some(*v),
+            ConfigSettingEntry::ContractDataEntrySizeBytes(v) => max_entry_size = Some(*v),
+            ConfigSettingEntry::ContractMaxSizeBytes(v) => max_code_size = Some(*v),
+            ConfigSettingEntry::LiveSorobanStateSizeWindow(v) => {
+                state_size_window = Some(v.clone())
+            }
+            _ => {}
+        }
+    }
+
+    let compute = compute.expect("missing ContractComputeV0");
+    let ledger_cost = ledger_cost.expect("missing ContractLedgerCostV0");
+    let ledger_cost_ext = ledger_cost_ext.expect("missing ContractLedgerCostExtV0");
+    let historical_data = historical_data.expect("missing ContractHistoricalDataV0");
+    let events = events.expect("missing ContractEventsV0");
+    let bandwidth = bandwidth.expect("missing ContractBandwidthV0");
+    let state_archival = state_archival.expect("missing StateArchival");
+
+    let limits = InvocationResourceLimits {
+        instructions: compute.tx_max_instructions,
+        mem_bytes: i64::from(compute.tx_memory_limit),
+        disk_read_entries: ledger_cost.tx_max_disk_read_entries,
+        write_entries: ledger_cost.tx_max_write_ledger_entries,
+        ledger_entries: ledger_cost_ext.tx_max_footprint_entries,
+        disk_read_bytes: ledger_cost.tx_max_disk_read_bytes,
+        write_bytes: ledger_cost.tx_max_write_bytes,
+        contract_events_size_bytes: events.tx_max_contract_events_size_bytes,
+        max_contract_data_key_size_bytes: max_key_size.expect("missing ContractDataKeySizeBytes"),
+        max_contract_data_entry_size_bytes: max_entry_size
+            .expect("missing ContractDataEntrySizeBytes"),
+        max_contract_code_entry_size_bytes: max_code_size.expect("missing ContractMaxSizeBytes"),
+    };
+
+    let fee_config = FeeConfiguration {
+        fee_per_instruction_increment: compute.fee_rate_per_instructions_increment,
+        fee_per_disk_read_entry: ledger_cost.fee_disk_read_ledger_entry,
+        fee_per_write_entry: ledger_cost.fee_write_ledger_entry,
+        fee_per_disk_read_1kb: ledger_cost.fee_disk_read1_kb,
+        fee_per_write_1kb: ledger_cost_ext.fee_write1_kb,
+        fee_per_historical_1kb: historical_data.fee_historical1_kb,
+        fee_per_contract_event_1kb: events.fee_contract_events1_kb,
+        fee_per_transaction_size_1kb: bandwidth.fee_tx_size1_kb,
+    };
+
+    let live_rent_fee_per_1kb = state_size_window.and_then(|window| {
+        if window.is_empty() {
+            return None;
+        }
+        let avg_size: u64 =
+            window.iter().fold(0u64, |acc, x| acc.saturating_add(*x)) / window.len() as u64;
+        let write_fee_config = RentWriteFeeConfiguration {
+            state_target_size_bytes: ledger_cost.soroban_state_target_size_bytes,
+            rent_fee_1kb_state_size_low: ledger_cost.rent_fee1_kb_soroban_state_size_low,
+            rent_fee_1kb_state_size_high: ledger_cost.rent_fee1_kb_soroban_state_size_high,
+            state_size_rent_fee_growth_factor: ledger_cost.soroban_state_rent_fee_growth_factor,
+        };
+        Some(compute_rent_write_fee_per_1kb(
+            i64::try_from(avg_size).unwrap(),
+            &write_fee_config,
+        ))
+    });
+
+    (
+        limits,
+        fee_config,
+        state_archival.persistent_rent_rate_denominator,
+        state_archival.temp_rent_rate_denominator,
+        live_rent_fee_per_1kb,
+    )
+}
+
+#[test]
+fn test_mainnet_limits_and_fees_snapshot() {
+    use crate::testutils::cost_estimate::{CostEstimate, NetworkInvocationResourceLimits};
+    use soroban_env_host::InvocationResourceLimits;
+    use soroban_sdk::xdr::{
+        ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+        ConfigSettingContractEventsV0, ConfigSettingContractHistoricalDataV0,
+        ConfigSettingContractLedgerCostExtV0, ConfigSettingContractLedgerCostV0,
+        ConfigSettingEntry, ConfigUpgradeSet, Limits, ReadXdr, StateArchivalSettings,
+    };
+
+    let sdk_limits = InvocationResourceLimits::mainnet();
+    let (sdk_fee_config, sdk_fee_per_rent_1kb, sdk_persistent_rent_denom, sdk_temp_rent_denom) =
+        CostEstimate::mainnet_fee_config();
+
+    // Ensure the default test budget limits and `InvocationResourceLimits::mainnet()`
+    // stay in sync.
+    let e = Env::default();
+    let budget_debug = format!("{:#?}", e.cost_estimate().budget());
+    assert!(
+        budget_debug.contains(&format!("Cpu limit: {};", sdk_limits.instructions)),
+        "Env::default() budget CPU limit drifted from InvocationResourceLimits::mainnet().instructions"
+    );
+    assert!(
+        budget_debug.contains(&format!("Mem limit: {};", sdk_limits.mem_bytes)),
+        "Env::default() budget Mem limit drifted from InvocationResourceLimits::mainnet().mem_bytes"
+    );
+
+    // When `MAINNET_NETWORK_SETTINGS_XDR` is provided (e.g. from
+    // `stellar network settings --network mainnet --internal --output xdr` in
+    // the scheduled drift-detection workflow), compare the live network
+    // settings against the hardcoded SDK snapshot. Otherwise, verify the
+    // extractor against the 2026-07-10 snapshot fixture.
+    let upgrade_set = match std::env::var("MAINNET_NETWORK_SETTINGS_XDR") {
+        Ok(xdr_b64) if !xdr_b64.trim().is_empty() => {
+            ConfigUpgradeSet::from_xdr_base64(xdr_b64.trim(), Limits::none())
+                .expect("failed to decode MAINNET_NETWORK_SETTINGS_XDR as ConfigUpgradeSet")
+        }
+        _ => ConfigUpgradeSet {
+            updated_entry: vec![
+                ConfigSettingEntry::ContractMaxSizeBytes(
+                    sdk_limits.max_contract_code_entry_size_bytes,
+                ),
+                ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 1_000_000_000,
+                    tx_max_instructions: sdk_limits.instructions,
+                    fee_rate_per_instructions_increment: sdk_fee_config
+                        .fee_per_instruction_increment,
+                    tx_memory_limit: u32::try_from(sdk_limits.mem_bytes).unwrap(),
+                }),
+                ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                    ledger_max_disk_read_entries: 1000,
+                    ledger_max_disk_read_bytes: 200_000,
+                    ledger_max_write_ledger_entries: 500,
+                    ledger_max_write_bytes: 132_096,
+                    tx_max_disk_read_entries: sdk_limits.disk_read_entries,
+                    tx_max_disk_read_bytes: sdk_limits.disk_read_bytes,
+                    tx_max_write_ledger_entries: sdk_limits.write_entries,
+                    tx_max_write_bytes: sdk_limits.write_bytes,
+                    fee_disk_read_ledger_entry: sdk_fee_config.fee_per_disk_read_entry,
+                    fee_write_ledger_entry: sdk_fee_config.fee_per_write_entry,
+                    fee_disk_read1_kb: sdk_fee_config.fee_per_disk_read_1kb,
+                    soroban_state_target_size_bytes: 30_000_000_000,
+                    rent_fee1_kb_soroban_state_size_low: 1_000,
+                    rent_fee1_kb_soroban_state_size_high: 10_000,
+                    soroban_state_rent_fee_growth_factor: 1_000,
+                }),
+                ConfigSettingEntry::ContractLedgerCostExtV0(ConfigSettingContractLedgerCostExtV0 {
+                    tx_max_footprint_entries: sdk_limits.ledger_entries,
+                    fee_write1_kb: sdk_fee_config.fee_per_write_1kb,
+                }),
+                ConfigSettingEntry::ContractHistoricalDataV0(
+                    ConfigSettingContractHistoricalDataV0 {
+                        fee_historical1_kb: sdk_fee_config.fee_per_historical_1kb,
+                    },
+                ),
+                ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
+                    tx_max_contract_events_size_bytes: sdk_limits.contract_events_size_bytes,
+                    fee_contract_events1_kb: sdk_fee_config.fee_per_contract_event_1kb,
+                }),
+                ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
+                    ledger_max_txs_size_bytes: 1_000_000,
+                    tx_max_size_bytes: 131_072,
+                    fee_tx_size1_kb: sdk_fee_config.fee_per_transaction_size_1kb,
+                }),
+                ConfigSettingEntry::ContractDataKeySizeBytes(
+                    sdk_limits.max_contract_data_key_size_bytes,
+                ),
+                ConfigSettingEntry::ContractDataEntrySizeBytes(
+                    sdk_limits.max_contract_data_entry_size_bytes,
+                ),
+                ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                    max_entry_ttl: 6_312_000,
+                    min_temporary_ttl: 16,
+                    min_persistent_ttl: 2_073_600,
+                    persistent_rent_rate_denominator: sdk_persistent_rent_denom,
+                    temp_rent_rate_denominator: sdk_temp_rent_denom,
+                    max_entries_to_archive: 1000,
+                    live_soroban_state_size_window_sample_size: 30,
+                    live_soroban_state_size_window_sample_period: 64,
+                    eviction_scan_size: 100_000,
+                    starting_eviction_scan_level: 7,
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        },
+    };
+
+    let (
+        network_limits,
+        network_fee_config,
+        network_persistent_rent_denom,
+        network_temp_rent_denom,
+        live_rent_fee_per_1kb,
+    ) = extract_mainnet_limits_and_fees(&upgrade_set);
+
+    assert_eq!(
+        network_limits, sdk_limits,
+        "InvocationResourceLimits::mainnet() drifted from Mainnet network settings"
+    );
+    assert_eq!(
+        network_fee_config, sdk_fee_config,
+        "CostEstimate::fee() FeeConfiguration drifted from Mainnet network settings"
+    );
+    assert_eq!(
+        network_persistent_rent_denom, sdk_persistent_rent_denom,
+        "CostEstimate::fee() persistent_rent_rate_denominator drifted from Mainnet network settings"
+    );
+    assert_eq!(
+        network_temp_rent_denom, sdk_temp_rent_denom,
+        "CostEstimate::fee() temp_rent_rate_denominator drifted from Mainnet network settings"
+    );
+    if let Some(live_rent) = live_rent_fee_per_1kb {
+        assert!(
+            sdk_fee_per_rent_1kb >= live_rent,
+            "CostEstimate::fee() conservative fee_per_rent_1kb overestimate ({sdk_fee_per_rent_1kb}) is below live Mainnet rent fee ({live_rent})"
+        );
+    }
+}
